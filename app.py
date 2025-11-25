@@ -5,15 +5,25 @@ import time
 import json
 import numpy as np
 from ultralytics import YOLO
+from supabase import create_client, Client
 
 app = Flask(__name__)
 UPLOAD_FOLDER = 'uploads'
 PROCESSED_FOLDER = 'processed'
+VIDEO_NAME = "processed.mp4"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(PROCESSED_FOLDER, exist_ok=True)
 
+SUPABASE_URL = "https://tyiiawylacwgxproemzc.supabase.co"
+SUPABASE_KEY = "sb_secret_FojsYWzigjRrieh0k6VAEw_LgjFTw-6"
+SUPABASE_BUCKET = "video_violation"
+
+NGROK_URL = "https://redfish-fancy-solely.ngrok-free.app"
+
 # Load YOLOv8 model
 model = YOLO("vehicle_model.pt")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ---- Time threshold in seconds ----
 STAY_THRESHOLD = 20
@@ -28,12 +38,14 @@ def upload_video():
         video_file = request.files['video']
 
         input_path = os.path.join(UPLOAD_FOLDER, 'input.mp4')
-        output_path = os.path.join(PROCESSED_FOLDER, 'processed.mp4')
+        output_path = os.path.join(PROCESSED_FOLDER, VIDEO_NAME)
 
         video_file.save(input_path)
 
         # ---- Initialize Video I/O ----
         cap = cv2.VideoCapture(input_path)
+        current_frame = 0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = cap.get(cv2.CAP_PROP_FPS)
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -41,21 +53,17 @@ def upload_video():
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
-        # ---- Tracking time dictionary ----
-        # Dictionary: { track_id : { "first_seen": timestamp, "last_seen": timestamp } }
         object_times = {}
-
-        # ---- Final registered objects ----
         registered_objects = set()
-
-        start_processing_time = time.time()
 
         while True:
             ret, frame = cap.read()
+            current_frame += 1
+            progress = (current_frame / total_frames) * 100.0
+            print(f"Processing progress: {progress:.2f}%")
             if not ret:
                 break
 
-            # YOLO Tracking
             results = model.track(frame, persist=True, verbose=False)
 
             if results and results[0].boxes.id is not None:
@@ -66,7 +74,6 @@ def upload_video():
                 for box, track_id in zip(boxes, ids):
                     x1, y1, x2, y2 = map(int, box)
 
-                    # Initialize tracking entry if new ID
                     if track_id not in object_times:
                         object_times[track_id] = {
                             "first_seen": current_timestamp,
@@ -75,43 +82,42 @@ def upload_video():
                     else:
                         object_times[track_id]["last_seen"] = current_timestamp
 
-                    # Calculate duration
                     duration = object_times[track_id]["last_seen"] - object_times[track_id]["first_seen"]
 
-                    # If duration above threshold → red box + register object
                     if duration >= STAY_THRESHOLD:
-                        color = (0, 0, 255)  # RED
+                        color = (0, 0, 255)
                         registered_objects.add(track_id)
                     else:
-                        color = (0, 255, 0)  # GREEN
+                        color = (0, 255, 0)
 
-                    # Draw box
                     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-
-                    # Draw text
-                    cv2.putText(
-                        frame,
-                        f"ID {track_id} | {duration:.1f}s",
-                        (x1, y1 - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        color,
-                        1
-                    )
+                    cv2.putText(frame, f"ID {track_id} | {duration:.1f}s", (x1, y1 - 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
             out.write(frame)
 
         cap.release()
         out.release()
 
-        # Final count = number of objects exceeding threshold
-        tracked_count = len(registered_objects)
+        # --- Upload to Supabase ---
+        print("Uploading processed video to Supabase...")
+        # Delete existing
+        existing_files = supabase.storage.from_(SUPABASE_BUCKET).list()
+        for file in existing_files:
+            if file['name'] == VIDEO_NAME:
+                supabase.storage.from_(SUPABASE_BUCKET).remove([VIDEO_NAME])
+                print("Deleted previous video from Supabase.")
+                break
 
-        video_url = url_for('get_processed_video', _external=True)
+        with open(output_path, "rb") as f:
+            supabase.storage.from_(SUPABASE_BUCKET).upload(VIDEO_NAME, f.read())
+        print("Upload complete!")
+
+        public_url = supabase.storage.from_(SUPABASE_BUCKET).get_public_url(VIDEO_NAME)
 
         return jsonify({
-            "tracked_objects": tracked_count,
-            "video_url": video_url
+            "tracked_objects": len(registered_objects),
+            "video_url": public_url
         })
 
     except Exception as e:
@@ -121,12 +127,9 @@ def upload_video():
 
 @app.route('/processed_video')
 def get_processed_video():
-    output_path = os.path.join(PROCESSED_FOLDER, 'processed.mp4')
-    if not os.path.exists(output_path):
-        return jsonify({"error": "Processed video not found"}), 404
-
-    return send_file(output_path, mimetype='video/mp4')
-
+    # Just return the public URL of the latest uploaded video
+    public_url = supabase.storage.from_(SUPABASE_BUCKET).get_public_url(VIDEO_NAME)
+    return jsonify({"video_url": public_url})
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
